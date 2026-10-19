@@ -1092,7 +1092,7 @@ def _package_expiry(item: dict) -> int | None:
     return int(naive.replace(tzinfo=_PACKAGE_END_TZ).timestamp())
 
 
-async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
+async def probe_account(auth: dict, model: str | None = None) -> tuple[bool, str]:
     """以最小**流式**对话请求探测账号可用性。
 
     必须用流式：上游强制要求 stream=true，非流式会返回
@@ -1112,6 +1112,10 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
         return False, '该账号无有效 accessToken'
 
     realm = realm_of(auth)
+    # 国际版用上游实测的 tier0 免费模型（usage.credit=0）：国际版积分常为 0，
+    # 用收费的 glm-5.2 去探会被腾讯直接拦（429 / 14017），账号本身并没坏。
+    if not model:
+        model = 'deepseek-v4.1-flash' if realm == GLOBAL else 'glm-5.2'
     uid = str(auth.get('uid') or '')
     enterprise_id = str(auth.get('enterprise_id') or '')
     domain = str(auth.get('domain') or '')
@@ -1144,8 +1148,9 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
     # 缺 X-Conversation-ID 即判 11-128「conversation id missing」—— 被灰度到的账号在
     # 探测里必红（真实对话走网关，同一族头由上游补）。这里补齐官方客户端那几支；
     # 四个 ID 各有语义（会话 / 轮 / 消息 / 根），不要图省事复用成同一个值。
+    conv_id = uuid.uuid4().hex
     headers.update({
-        'X-Conversation-ID': uuid.uuid4().hex,
+        'X-Conversation-ID': conv_id,
         'X-Conversation-Request-ID': uuid.uuid4().hex,
         'X-Conversation-Message-ID': uuid.uuid4().hex,
         'X-Root-Request-ID': uuid.uuid4().hex,
@@ -1154,6 +1159,8 @@ async def probe_account(auth: dict, model: str = 'glm-5.2') -> tuple[bool, str]:
 
     payload = {
         'model': model,
+        # 与请求头 X-Conversation-ID 同值：头是校验对象，body 一并带上保持一致。
+        'conversationId': conv_id,
         # **首条必须是 system**：上游要求 messages[0].role == 'system'，否则返回
         # 11-128「first message is not system prompt」。
         #
@@ -1222,15 +1229,26 @@ def _is_channel_check(code: object, raw: str) -> bool:
     return ('渠道校验' in raw or 'channel verification' in low or 'official client' in low)
 
 def _parse_error_body(raw: str, status: int) -> tuple[int | str, str]:
-    """错误响应可能是 {code,msg} 信封，也可能是纯文本。"""
+    """错误响应可能是 {code,msg}，也可能包在 error.data 里，或是纯文本。
+
+    国际版未激活试用时 HTTP 状态是 429，真正的业务码在 error.data.code
+    （14017）。只看顶层 code 会把 429 原样弹出去，真正的原因被丢掉。
+    """
     try:
         env = json.loads(raw)
-        if isinstance(env, dict):
-            return env.get('code', status), str(env.get('msg') or env.get('message') or '')
     except Exception:  # noqa: BLE001
-        pass
-    return status, raw.strip()[:200]
-
+        return status, raw.strip()[:200]
+    if not isinstance(env, dict):
+        return status, raw.strip()[:200]
+    err = env.get('error')
+    data = err.get('data') if isinstance(err, dict) else None
+    if isinstance(data, dict) and data.get('code') is not None:
+        return data.get('code'), str(data.get('msg') or data.get('message') or '')
+    if env.get('code') is not None:
+        return env.get('code'), str(env.get('msg') or env.get('message') or '')
+    if isinstance(err, dict):
+        return status, str(err.get('message') or err.get('msg') or '')
+    return status, str(env.get('msg') or env.get('message') or '')
 
 # 已知业务码 -> 可读说明（来源：workbuddy2api 源码与实测）
 #
@@ -1245,6 +1263,8 @@ _CODE_HINTS: dict[int | str, str] = {
     # 不靠文案猜——429 上「额度不足」的措辞跨计费与限流两界）。本端跟着翻译：
     # 连通性测试打到欠费号时，用户要知道是没积分了，而不是「账号坏了」。
     14018: '账号积分耗尽（等签到恢复或换账号）',
+    14017: '国际版试用未激活：重新添加账号时先选地区，再扫码',
+    6004: '该账号此模型已达使用频率上限（上游给的时刻会自动重置）',
     '11-128': '首条消息必须是 system（网关提示词未注入时客户端需自带）',
     12153: '会话已失效，需重新登录',
 }

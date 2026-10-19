@@ -1,0 +1,150 @@
+diff --git a/internal/upstream/client.go b/internal/upstream/client.go
+index e9b155e..94e5b48 100644
+--- a/internal/upstream/client.go
++++ b/internal/upstream/client.go
+@@ -1237,6 +1237,9 @@ func (c *Client) ChatStreamContext(ctx context.Context, a *auth.Auth, body []byt
+ 				return nil, 0, nil, fmt.Errorf("read body: %w", rerr)
+ 			}
+ 			kind := Classify(resp.StatusCode, string(raw))
++			if kind == ErrToolCallMismatch {
++				log.Printf("DIAG: [upstream] 11148 acct=%s: %s", logfmt.Label(a.UID, a.Nickname), diagToolPairing(prepared))
++			}
+ 			log.Printf("WARN: [upstream] chat_stream acct=%s: upstream %d %s body=%s",
+ 				logfmt.Label(a.UID, a.Nickname), resp.StatusCode, kind, truncate(string(raw), 200))
+ 			// 路径级拒绝 → 换下一个候选路径再试，**不**把它当账号问题。
+diff --git a/internal/upstream/tool_pairing_debug.go b/internal/upstream/tool_pairing_debug.go
+new file mode 100644
+index 0000000..2a5bd6a
+--- /dev/null
++++ b/internal/upstream/tool_pairing_debug.go
+@@ -0,0 +1,130 @@
++package upstream
++
++import (
++	"encoding/json"
++	"fmt"
++	"sort"
++	"strings"
++)
++
++// diagToolPairing 11148（tool calls and tool results do not match）诊断：
++// 输出出站 messages 的工具配对结构摘要，用于定位腾讯判定「配对不上」的具体位置。
++//
++// 只读、不改请求；只输出 role / id / 类型，**不输出消息内容**（不落盘、不含业务数据）。
++// 定位经验：线上一条 623 条历史、319 对工具调用全部配对的请求仍被 11148 拒绝，
++// 靠这份摘要 + 逐段二分才查出真因是插在调用与结果之间的 assistant 解析碎片
++// （字面量 "</tool_call>"），见 tool_pairing.go 的 repackToolResultBlocks。
++func diagToolPairing(body []byte) string {
++	var obj map[string]any
++	if err := json.Unmarshal(body, &obj); err != nil {
++		return "unmarshal-failed: " + err.Error()
++	}
++	msgs, ok := obj["messages"].([]any)
++	if !ok {
++		return "no-messages-field"
++	}
++
++	callIdx := map[string]int{}
++	callIDs := map[string]int{}
++	resultIDs := map[string]int{}
++	var anomalies []string
++	addAnom := func(s string) {
++		if len(anomalies) < 12 {
++			anomalies = append(anomalies, s)
++		}
++	}
++	badArgs, badCallShape := 0, 0
++
++	for i, m := range msgs {
++		msg, ok := m.(map[string]any)
++		if !ok {
++			addAnom(fmt.Sprintf("#%d:nonmap", i))
++			continue
++		}
++		role, _ := msg["role"].(string)
++		switch role {
++		case "tool":
++			id, _ := msg["tool_call_id"].(string)
++			if id == "" {
++				addAnom(fmt.Sprintf("#%d:tool-no-id", i))
++			} else {
++				resultIDs[id]++
++				if ci, seen := callIdx[id]; !seen {
++					addAnom(fmt.Sprintf("#%d:result-before-call(%s)", i, shortID(id)))
++				} else if ci > i {
++					addAnom(fmt.Sprintf("#%d:result-before-call#%d(%s)", i, ci, shortID(id)))
++				}
++			}
++			if _, ok := msg["content"].(string); !ok {
++				addAnom(fmt.Sprintf("#%d:tool-content-not-string(%T)", i, msg["content"]))
++			}
++		case "assistant":
++			tcs, hasCalls := msg["tool_calls"].([]any)
++			if !hasCalls {
++				continue
++			}
++			for _, tci := range tcs {
++				tc, ok := tci.(map[string]any)
++				if !ok {
++					badCallShape++
++					continue
++				}
++				id, _ := tc["id"].(string)
++				if id == "" {
++					addAnom(fmt.Sprintf("#%d:tool-call-no-id", i))
++					continue
++				}
++				callIDs[id]++
++				if _, seen := callIdx[id]; !seen {
++					callIdx[id] = i
++				}
++				fn, ok := tc["function"].(map[string]any)
++				if !ok {
++					badCallShape++
++					addAnom(fmt.Sprintf("#%d:function-not-object(%T)", i, tc["function"]))
++					continue
++				}
++				if _, ok := fn["name"].(string); !ok {
++					badCallShape++
++					addAnom(fmt.Sprintf("#%d:function-name-not-string", i))
++				}
++				if _, ok := fn["arguments"].(string); !ok {
++					badArgs++
++					addAnom(fmt.Sprintf("#%d:arguments-not-string(%T)", i, fn["arguments"]))
++				}
++			}
++		}
++	}
++
++	var orphanCalls, orphanResults, dupCalls []string
++	for id, n := range callIDs {
++		if resultIDs[id] == 0 {
++			orphanCalls = append(orphanCalls, shortID(id))
++		}
++		if n > 1 {
++			dupCalls = append(dupCalls, fmt.Sprintf("%s x%d", shortID(id), n))
++		}
++	}
++	for id := range resultIDs {
++		if callIDs[id] == 0 {
++			orphanResults = append(orphanResults, shortID(id))
++		}
++	}
++	sort.Strings(orphanCalls)
++	sort.Strings(orphanResults)
++	sort.Strings(dupCalls)
++
++	return fmt.Sprintf("bytes=%d msgs=%d calls=%d results=%d orphanCalls=[%s] orphanResults=[%s] dup=[%s] "+
++		"arguments-not-string=%d call-shape-bad=%d anomalies=[%s]",
++		len(body), len(msgs), len(callIDs), len(resultIDs),
++		strings.Join(orphanCalls, "; "), strings.Join(orphanResults, "; "), strings.Join(dupCalls, "; "),
++		badArgs, badCallShape, strings.Join(anomalies, "; "))
++}
++
++// shortID 截短 id 便于日志阅读（保留首尾，中间省略）。
++func shortID(id string) string {
++	if len(id) <= 18 {
++		return id
++	}
++	return id[:10] + ".." + id[len(id)-6:]
++}

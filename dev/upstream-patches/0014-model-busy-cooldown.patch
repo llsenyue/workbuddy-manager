@@ -1,0 +1,79 @@
+diff --git a/internal/server/handler.go b/internal/server/handler.go
+index e8c4997..32dfae6 100644
+--- a/internal/server/handler.go
++++ b/internal/server/handler.go
+@@ -59,6 +59,10 @@ type Config struct {
+ // 若共用 soft_rate（600s 起 + 指数升级），一次偶发 404 会把好账号罚 10 分钟并逐次加倍。
+ // 故固定 60s 防雪崩即可，不随 soft_rate 配置、也不参与软退避指数。
+ const notFoundCooldown = 60 * time.Second
++// modelBusyCooldown 14003「模型繁忙」的 (账号,模型) 级冷却时长。
++// 这不是账号问题——上游 displayMsg 原文就是「模型繁忙，请换模型或稍后重试」。
++// 只冷却这一对，账号保持健康、换个模型即可继续用。
++const modelBusyCooldown = 60 * time.Second
+ 
+ // wafCooldownBase WAF 403 软冷却基数（任务书 P0-1 建议 60s 起；抖动 ±25% 后落
+ // [45s,75s]，实际进入 CooldownSoftRate 后再按 softStreak 指数、封顶 soft_rate_max）。
+@@ -1103,6 +1107,15 @@ func (h *Handler) applyErrorPolicy(uid string, kind upstream.ErrKind, body, mode
+ 		// 不需要异步核查（冗余）。立即换号。
+ 		h.cfg.Pool.CooldownUntilTomorrow4AM(uid, "余额不足")
+ 	case upstream.ErrSoftRate:
++		// 14003「模型繁忙」是模型侧过载，不是账号被限流。若不单独处理，它会落到
++		// 下方的账号级有界退避（soft_rate 基数 600s 起、指数放大到 soft_rate_max，且
++		// modelCooldowns=nil 连切模型都救不了）——实测 92% 的账号冷却都是这一条造成的。
++		// 正确语义：只冷却 (账号,模型) 这一对，账号保持健康、换模型就能继续用。
++		if strings.Contains(body, "14003") {
++			h.cfg.Pool.CooldownSoftForModel(uid, modelBusyCooldown,
++				time.Now().Add(modelBusyCooldown), model, "14003 model busy")
++			return
++		}
+ 		// 统一对齐上游重置时间（重构核心）：只要 body 带「将在 … 重置」，无论业务
+ 		// code 是 6004 还是 11140 rate-limiting 等形态，都精确冷却到该墙钟、绝不
+ 		// softStreak 指数堆加。
+diff --git a/internal/server/handler_test.go b/internal/server/handler_test.go
+index 776c3e5..4f43ba9 100644
+--- a/internal/server/handler_test.go
++++ b/internal/server/handler_test.go
+@@ -2767,3 +2767,43 @@ func TestChatToolCallMismatchDoesNotRotateOrPenalize(t *testing.T) {
+ 		}
+ 	}
+ }
++
++// TestApplyErrorPolicy14003ModelBusyIsModelScoped 14003「模型繁忙」是**模型侧过载**，
++// 不是账号被限流：必须只冷却 (账号, 模型) 这一对、时长固定 modelBusyCooldown，账号本身
++// 保持健康（换个模型立刻可用）。
++//
++// 回归背景：未分流前 14003 落进 ErrSoftRate 的账号级有界退避（soft_rate 600s 起、
++// softStreak 指数放大到 soft_rate_max，且 modelCooldowns=nil 连切模型都救不了）。
++// 线上实测 6 小时内 13 次冷却有 12 次（92%）由这一条产生 —— 一次模型过载把整池好号
++// 罚成「冷却中」，面板显示「冷却中·N 分钟」而账号其实完全健康。
++func TestApplyErrorPolicy14003ModelBusyIsModelScoped(t *testing.T) {
++	p := pool.New("")
++	p.Add(&auth.Auth{UID: "u1"})
++	h := NewHandler(Config{Pool: p, SoftCooldown: 600 * time.Second})
++
++
++	body := `{"code":14003,"msg":"too many requests","displayMsg":{"zh":"模型繁忙，请换模型或稍后重试"}}`
++	h.applyErrorPolicy("u1", upstream.ErrSoftRate, body, "deepseek-v4.1-flash", nil)
++	st, ok := p.Status("u1")
++	if !ok {
++		t.Fatal("u1 missing")
++	}
++	// 账号级冷却不得发生：账号本身健康，换模型即可继续用。
++	if st.Cooling {
++		t.Fatalf("14003 不应产生账号级冷却（账号是好的）: %+v", st)
++	}
++	if st.SoftStreak != 0 {
++		t.Errorf("14003 不参与 softStreak 退避，soft_streak=%d want 0", st.SoftStreak)
++	}
++	// 只冷却该模型，且时长固定 modelBusyCooldown（不是 600s 基数、不指数放大）。
++	if len(st.RateLimitedModels) != 1 {
++		t.Fatalf("应只有一条模型级台账，实际 %+v", st.RateLimitedModels)
++	}
++	rm := st.RateLimitedModels[0]
++	if rm.Model != "deepseek-v4.1-flash" {
++		t.Errorf("模型级台账应指向被拒模型，实际 %q", rm.Model)
++	}
++	if d := time.Until(rm.Until); d > modelBusyCooldown+time.Second || d < modelBusyCooldown-time.Minute {
++		t.Errorf("模型冷却时长应约等于 modelBusyCooldown(%v)，实际 %v", modelBusyCooldown, d)
++	}
++}

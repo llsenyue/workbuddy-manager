@@ -1,0 +1,88 @@
+diff --git a/internal/upstream/tool_pairing.go b/internal/upstream/tool_pairing.go
+index c2da912..4d34eac 100644
+--- a/internal/upstream/tool_pairing.go
++++ b/internal/upstream/tool_pairing.go
+@@ -82,12 +82,24 @@ func repackToolResultBlocks(messages []any) ([]any, bool) {
+ 				continue
+ 			}
+ 			// System/developer notices may precede the first result or split parallel results.
+-			// Keep them in this block and never cross a user or assistant turn.
++			// Keep them in this block and never cross a user turn.
+ 			if role == "system" || role == "developer" {
+ 				notices = append(notices, messages[i])
+ 				i++
+ 				continue
+ 			}
++			// 解析残留同样要挪：模型流式输出里的 XML 碎片（如字面量 "</tool_call>"）
++			// 会被客户端落成一条无 tool_calls 的 assistant 消息，插在调用与其结果之间，
++			// 上游判 11148 顶死整条会话（实测 623 条历史 #332 调用 / #333 碎片 / #334 结果）。
++			// 与 system/developer 通知同口径：挪到整组结果之后，保留内容不丢上下文。
++			// 带 tool_calls 的 assistant 是真回合边界，仍然 break（不跨越）。
++			if role == "assistant" {
++				if tcs2, ok2 := mm["tool_calls"].([]any); !ok2 || len(tcs2) == 0 {
++					notices = append(notices, messages[i])
++					i++
++					continue
++				}
++			}
+ 			break
+ 		}
+ 		if len(results) == 0 {
+diff --git a/internal/upstream/tool_pairing_test.go b/internal/upstream/tool_pairing_test.go
+index 1e5c97f..49e2755 100644
+--- a/internal/upstream/tool_pairing_test.go
++++ b/internal/upstream/tool_pairing_test.go
+@@ -504,3 +504,53 @@ func TestRepackToolResultBlocksTrailingNoticeIsNoop(t *testing.T) {
+ 		t.Fatalf("trailing notice should be a no-op: changed=%v out=%#v", changed, out)
+ 	}
+ }
++
++// TestRepackToolResultBlocksAssistantFragment 模型流式输出残留的 XML 碎片（如字面量
++// "</tool_call>"）会被客户端落成一条**无 tool_calls 的 assistant 消息**，插在调用与
++// 其结果之间 —— 上游据此判 11148 并顶死整条会话（线上实测：623 条历史里 #332 调用 /
++// #333 "</tool_call>" / #334 结果）。与 developer 通知同口径：挪到整组结果之后。
++func TestRepackToolResultBlocksAssistantFragment(t *testing.T) {
++	fragment := "</tool_call>"
++	messages := []any{
++		map[string]any{"role": "assistant", "tool_calls": []any{
++			map[string]any{"id": "c00", "type": "function", "function": map[string]any{"name": "pwsh", "arguments": "{}"}},
++		}},
++		map[string]any{"role": "assistant", "content": fragment},
++		map[string]any{"role": "tool", "tool_call_id": "c00", "content": "ok"},
++		map[string]any{"role": "user", "content": "next"},
++	}
++	out, changed := repackToolResultBlocks(messages)
++	if !changed {
++		t.Fatal("assistant 碎片应触发重排")
++	}
++	if len(out) != 4 {
++		t.Fatalf("消息数不应变化，实际 %d", len(out))
++	}
++	wantRoles := []string{"assistant", "tool", "assistant", "user"}
++	for i, w := range wantRoles {
++		got, _ := out[i].(map[string]any)["role"].(string)
++		if got != w {
++			t.Fatalf("out[%d] 角色应为 %s，实际 %s（%#v）", i, w, got, out)
++		}
++	}
++	if got, _ := out[2].(map[string]any)["content"].(string); got != fragment {
++		t.Fatalf("碎片内容不应改动，实际 %q", got)
++	}
++}
++
++// TestRepackToolResultBlocksAssistantWithCallsIsBoundary 带 tool_calls 的 assistant
++// 是真回合边界，不能被当作插入物吞进上一组（否则会把两个回合的结果混在一起）。
++func TestRepackToolResultBlocksAssistantWithCallsIsBoundary(t *testing.T) {
++	messages := []any{
++		map[string]any{"role": "assistant", "tool_calls": []any{
++			map[string]any{"id": "c00", "type": "function", "function": map[string]any{"name": "f", "arguments": "{}"}},
++		}},
++		map[string]any{"role": "assistant", "tool_calls": []any{
++			map[string]any{"id": "c01", "type": "function", "function": map[string]any{"name": "f", "arguments": "{}"}},
++		}},
++		map[string]any{"role": "tool", "tool_call_id": "c01", "content": "ok"},
++	}
++	if out, changed := repackToolResultBlocks(messages); changed {
++		t.Fatalf("带 tool_calls 的 assistant 是回合边界，不应重排：%#v", out)
++	}
++}
